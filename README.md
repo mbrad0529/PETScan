@@ -12,6 +12,13 @@ As mentioned in Platform, the device running the scripts needs a valid Python 3 
 The script requires at least one argument, the PE file to be analyzed. Additional options are available for generating a report (functionality coming in future release), choosing a deeper level of analysis (default is to only index Imports and Exports Data Directories) and to enable verbose output which provides detailed status messages at various stages of execution.
 
 # Releases
+2.0
+* Added hash digest and imports hash (imphash) info.
+* Added logic to check for valid code entry points and potentially dangerous libraries/functions imported.
+* Boilerplate code in place to eventually support Packer detection.
+* Added support for calculating entropy of PE file sections.
+* Added Alerts to output.
+
 1.0
 * Initial Release.
 * Support for generating Reports is not yet implemented, output redirection can be used to write data to a file.
