@@ -1,5 +1,7 @@
-import pefile
 import argparse
+import hashlib
+import pefile
+import re
 from prettytable import PrettyTable
 
 parser = argparse.ArgumentParser(description="Analyzes target PE file and reports various file attributes.")
@@ -35,13 +37,58 @@ else:  # Just grab the import and export directories to save time
     if args.verbose:
         print("Done.")
 
+# Tables to hold all our stuff
+WarningsTable = PrettyTable()
+AlertsTable = PrettyTable()
+SectionsTable = PrettyTable(["Name", "Address (Virtual)", "Size", "Entropy"])
+SectionsTable.align["Address (Virtual)"] = "r"
+SectionsTable.align["Size"] = "r"
+ImportsTable = PrettyTable(["DLL", "Function"])
+ExportsTable = PrettyTable(["Ordinal", "Function", "Address"])
+ExportsTable.align["Ordinal"] = "r"
+ExportsTable.align["Address"] = "r"
+DOSHeaderTable = PrettyTable(["Field", "val"])
+FileHeaderTable = PrettyTable(["Field", "val"])
+OptionalHeaderTable = PrettyTable(["Field", "val"])
+
+# updated version from: http://code.google.com/p/peframe/
+alert_functions = ['accept', 'AddCredentials', 'bind', 'CertDeleteCertificateFromStore', 'CheckRemoteDebuggerPresent', 'closesocket', 'connect', 'ConnectNamedPipe', 'CopyFile', 'CreateFile', 'CreateProcess', 'CreateToolhelp32Snapshot', 'CreateFileMapping', 'CreateRemoteThread', 'CreateDirectory', 'CreateService', 'CreateThread', 'CryptEncrypt', 'DeleteFile', 'DeviceIoControl', 'DisconnectNamedPipe', 'DNSQuery', 'EnumProcesses', 'ExitThread', 'FindWindow', 'FindResource', 'FindFirstFile', 'FindNextFile', 'FltRegisterFilter', 'FtpGetFile', 'FtpOpenFile', 'GetCommandLine', 'GetThreadContext', 'GetDriveType', 'GetFileSize', 'GetFileAttributes', 'GetHostByAddr', 'GetHostByName', 'GetHostName', 'GetModuleHandle', 'GetProcAddress', 'GetTempFileName', 'GetTempPath', 'GetTickCount', 'GetUpdateRect', 'GetUpdateRgn', 'GetUserNameA', 'GetUrlCacheEntryInfo', 'GetComputerName', 'GetVersionEx', 'GetModuleFileName', 'GetStartupInfo', 'GetWindowThreadProcessId', 'HttpSendRequest', 'HttpQueryInfo', 'IcmpSendEcho', 'IsDebuggerPresent', 'InternetCloseHandle', 'InternetConnect', 'InternetCrackUrl', 'InternetQueryDataAvailable', 'InternetGetConnectedState', 'InternetOpen', 'InternetQueryDataAvailable', 'InternetQueryOption', 'InternetReadFile', 'InternetWriteFile', 'LdrLoadDll', 'LoadLibrary', 'LoadLibraryA', 'LockResource', 'listen', 'MapViewOfFile', 'OutputDebugString', 'OpenFileMapping', 'OpenProcess', 'Process32First', 'Process32Next', 'recv', 'ReadProcessMemory', 'RegCloseKey', 'RegCreateKey', 'RegDeleteKey', 'RegDeleteValue', 'RegEnumKey', 'RegOpenKey', 'send', 'sendto', 'SetKeyboardState', 'SetWindowsHook', 'ShellExecute', 'Sleep', 'socket', 'StartService', 'TerminateProcess', 'UnhandledExceptionFilter', 'URLDownload', 'VirtualAlloc', 'VirtualProtect', 'VirtualAllocEx', 'WinExec', 'WriteProcessMemory', 'WriteFile', 'WSASend', 'WSASocket', 'WSAStartup', 'ZwQueryInformation']
+
+alert_libraries = ['ntoskrnl.exe', 'hal.dll', 'ndis.sys']
+
+# legit entry point sections
+good_entry_locations = ['.text', '.code', 'CODE', 'INIT', 'PAGE']
+
 sections = []  # List to hold section info
+
+
+f = open(args.filename, 'rb')
+data = f.read()
+print("Filename: " + args.filename)
+print("MD5: " + hashlib.md5(data).hexdigest())
+print("SHA1: " + hashlib.sha1(data).hexdigest())
+print("imphash: " + sample.get_imphash())
+
 
 if args.verbose:
     print("Parsing Section info...")
 
 for section in sample.sections:
-    sections.append((section.name, section.VirtualAddress, section.SizeOfRawData))
+    sections.append((section.name, section.VirtualAddress, section.SizeOfRawData, section.get_entropy()))
+
+    # Alert if the EP section is not in a known good section
+    name = ''
+    ep = sample.OPTIONAL_HEADER.AddressOfEntryPoint
+    pos = 0
+
+    if (ep >= section.VirtualAddress) and (ep < (section.VirtualAddress + section.Misc_VirtualSize)):
+        name = section.Name
+        break
+    else:
+        pos += 1
+
+    if name not in good_entry_locations:
+        print("Suspicious code entry point detected at position: " + pos)
 
 if args.verbose:
     print("Done.")
@@ -78,203 +125,36 @@ if args.verbose:
     print("Done.")
     print("Preparing output...")
 
-# Tables to hold all our stuff
-WarningsTable = PrettyTable()
-SectionsTable = PrettyTable(["Name", "Address (Virtual)", "Size"])
-SectionsTable.align["Address (Virtual)"] = "r"
-SectionsTable.align["Size"] = "r"
-ImportsTable = PrettyTable(["DLL", "Function"])
-ExportsTable = PrettyTable(["Ordinal", "Function", "Address"])
-ExportsTable.align["Ordinal"] = "r"
-ExportsTable.align["Address"] = "r"
-DOSHeaderTable = PrettyTable(["Field", "val"])
-FileHeaderTable = PrettyTable(["Field", "val"])
-OptionalHeaderTable = PrettyTable(["Field", "val"])
+crc_given = sample.OPTIONAL_HEADER.CheckSum
+crc_actual = sample.generate_checksum()
+if crc_given != crc_actual:
+    AlertsTable.add_row("Checksum mismatch, declared: " + crc_given + " vs actual: " + crc_actual)
+
+
+for lib in sample.DIRECTORY_ENTRY_IMPORT:
+    for entry in alert_libraries:
+        if re.search(lib.dll.decode(), entry, re.I):
+            AlertsTable.add_row("Suspicious DLL loaded: " + entry)
+    for imp in lib.imports:
+        if imp.name is not None:
+            for alert in alert_functions:
+                if imp.name.decode().startswith(alert):
+                    print("Potentially dangerous function imported: " + alert)
+'''
+signatures = peutils.SignatureDatabase('sigs.txt')
+matches = signatures.match(sample, ep_only=True)
+if matches:
+    for match in matches:
+        print("Binary may be packed, " + match + " signature detected.")
+'''
+
+# print(AlertsTable.get_string(title="Alerts"))
 
 if len(warnings) > 0:  # We have some warnings
     for warning in warnings:
         WarningsTable.add_row(warning)
 
     print(WarningsTable.get_string(title="Warnings"))
-
-''' Blocking this out for now until we can figure out how to avoid AttributeErrors
-var = 'e_magic'
-val = sample.DOS_HEADER.e_magic
-DOSHeaderTable.add_row([var, val])
-var = 'e_cblp'
-val = sample.DOS_HEADER.e_cblp
-DOSHeaderTable.add_row([var, val])
-var = 'e_cp'
-val = sample.DOS_HEADER.e_cp
-DOSHeaderTable.add_row([var, val])
-var = 'e_crlc'
-val = sample.DOS_HEADER.e_crlc
-DOSHeaderTable.add_row([var, val])
-var = 'e_cparhdr'
-val = sample.DOS_HEADER.e_cparhdr
-DOSHeaderTable.add_row([var, val])
-var = 'e_minalloc'
-val = sample.DOS_HEADER.e_minalloc
-DOSHeaderTable.add_row([var, val])
-var = 'e_maxalloc'
-val = sample.DOS_HEADER.e_maxalloc
-DOSHeaderTable.add_row([var, val])
-var = 'e_ss'
-val = sample.DOS_HEADER.e_ss
-DOSHeaderTable.add_row([var, val])
-var = 'e_sp'
-val = sample.DOS_HEADER.e_sp
-DOSHeaderTable.add_row([var, val])
-var = 'e_csum'
-val = sample.DOS_HEADER.e_csum
-DOSHeaderTable.add_row([var, val])
-var = 'e_ip'
-val = sample.DOS_HEADER.e_ip
-DOSHeaderTable.add_row([var, val])
-var = 'e_cs'
-val = sample.DOS_HEADER.e_cs
-DOSHeaderTable.add_row([var, val])
-var = 'e_lfarlc'
-val = sample.DOS_HEADER.e_lfarlc
-DOSHeaderTable.add_row([var, val])
-var = 'e_ovno'
-val = sample.DOS_HEADER.e_ovno
-DOSHeaderTable.add_row([var, val])
-var = 'e_res'
-val = sample.DOS_HEADER.e_res
-DOSHeaderTable.add_row([var, val])
-var = 'e_oemid'
-val = sample.DOS_HEADER.e_oemid
-DOSHeaderTable.add_row([var, val])
-var = 'e_oeminfo'
-val = sample.DOS_HEADER.e_oeminfo
-DOSHeaderTable.add_row([var, val])
-var = 'e_res2'
-val = sample.DOS_HEADER.e_res2
-DOSHeaderTable.add_row([var, val])
-var = 'e_lfanew'
-val = sample.DOS_HEADER.e_lfanew
-DOSHeaderTable.add_row([var, val])
-var = 'Machine'
-val = sample.FILE_HEADER.Machine
-FileHeaderTable.add_row([var, val])
-var = 'NumberOfSections'
-val = sample.FILE_HEADER.NumberOfSections
-FileHeaderTable.add_row([var, val])
-var = 'TimeDateStamp'
-val = sample.FILE_HEADER.TimeDateStamp
-FileHeaderTable.add_row([var, val])
-var = 'PointerToSymbolTable'
-val = sample.FILE_HEADER.PointerToSymbolTable
-FileHeaderTable.add_row([var, val])
-var = 'NumberOfSymbols'
-val = sample.FILE_HEADER.NumberOfSymbols
-FileHeaderTable.add_row([var, val])
-var = 'SizeOfOptionalHeader'
-val = sample.FILE_HEADER.SizeOfOptionalHeader
-FileHeaderTable.add_row([var, val])
-var = 'Characteristics'
-val = sample.FILE_HEADER.Characteristics
-FileHeaderTable.add_row([var, val])
-var = 'Flags'
-val = sample.FILE_HEADER.Flags
-FileHeaderTable.add_row([var, val])
-
-var = 'Magic'
-val = sample.OPTIONAL_HEADER.Magic
-OptionalHeaderTable.add_row([var, val])
-var = 'MajorLinkerVersion'
-val = sample.OPTIONAL_HEADER.MajorLinkerVersion
-OptionalHeaderTable.add_row([var, val])
-var = 'MinorLinkerVersion'
-val = sample.OPTIONAL_HEADER.MinorLinkerVersion
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfCode'
-val = sample.OPTIONAL_HEADER.SizeOfCode
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfInitializedData'
-val = sample.OPTIONAL_HEADER.SizeOfInitializedData
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfUninitializedData'
-val = sample.OPTIONAL_HEADER.SizeOfUninitializedData
-OptionalHeaderTable.add_row([var, val])
-var = 'AddressOfEntryPoint'
-val = sample.OPTIONAL_HEADER.AddressOfEntryPoint
-OptionalHeaderTable.add_row([var, val])
-var = 'BaseOfCode'
-val = sample.OPTIONAL_HEADER.BaseOfCode
-OptionalHeaderTable.add_row([var, val])
-var = 'BaseOfData'
-val = sample.OPTIONAL_HEADER.BaseOfData
-OptionalHeaderTable.add_row([var, val])
-var = 'ImageBase'
-val = sample.OPTIONAL_HEADER.ImageBase
-OptionalHeaderTable.add_row([var, val])
-var = 'SectionAlignment'
-val = sample.OPTIONAL_HEADER.SectionAlignment
-OptionalHeaderTable.add_row([var, val])
-var = 'FileAlignment'
-val = sample.OPTIONAL_HEADER.FileAlignment
-OptionalHeaderTable.add_row([var, val])
-var = 'MajorOperatingSystemVersion'
-val = sample.OPTIONAL_HEADER.MajorOperatingSystemVersion
-OptionalHeaderTable.add_row([var, val])
-var = 'MinorOperatingSystemVersion'
-val = sample.OPTIONAL_HEADER.MinorOperatingSystemVersion
-OptionalHeaderTable.add_row([var, val])
-var = 'MajorImageVersion'
-val = sample.OPTIONAL_HEADER.MajorImageVersion
-OptionalHeaderTable.add_row([var, val])
-var = 'MinorImageVersion'
-val = sample.OPTIONAL_HEADER.MinorImageVersion
-OptionalHeaderTable.add_row([var, val])
-var = 'MajorCheckSumVersion'
-val = sample.OPTIONAL_HEADER.MajorCheckSumVersion
-OptionalHeaderTable.add_row([var, val])
-var = 'MinorCheckSumVersion'
-val = sample.OPTIONAL_HEADER.MinorCheckSumVersion
-OptionalHeaderTable.add_row([var, val])
-var = 'Reserved1'
-val = sample.OPTIONAL_HEADER.Reserved1
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfImage'
-val = sample.OPTIONAL_HEADER.SizeOfImage
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfHeaders'
-val = sample.OPTIONAL_HEADER.SizeOfHeaders
-OptionalHeaderTable.add_row([var, val])
-var = 'CheckSum'
-val = sample.OPTIONAL_HEADER.CheckSum
-OptionalHeaderTable.add_row([var, val])
-var = 'Subsystem'
-val = sample.OPTIONAL_HEADER.Subsystem
-OptionalHeaderTable.add_row([var, val])
-var = 'DllCharacteristics'
-val = sample.OPTIONAL_HEADER.DllCharacteristics
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfStackReserve'
-val = sample.OPTIONAL_HEADER.SizeOfStackReserve
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfStackCommit'
-val = sample.OPTIONAL_HEADER.SizeOfStackCommit
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfHeapReserve'
-val = sample.OPTIONAL_HEADER.SizeOfHeapReserve
-OptionalHeaderTable.add_row([var, val])
-var = 'SizeOfHeapCommit'
-val = sample.OPTIONAL_HEADER.SizeOfHeapCommit
-OptionalHeaderTable.add_row([var, val])
-var = 'LoaderFlags'
-val = sample.OPTIONAL_HEADER.SizeOfHeapReserve
-OptionalHeaderTable.add_row([var, val])
-var = 'NumberOfRvaAndSizes'
-val = sample.OPTIONAL_HEADER.SizeOfHeapCommit
-OptionalHeaderTable.add_row([var, val])
-
-print(DOSHeaderTable.get_string(title="DOS Header"))
-print(FileHeaderTable.get_string(title="File Header"))
-print(OptionalHeaderTable.get_string(title="Optional Header"))
-'''
 
 #  PLACEHOLDER TO GET INFO FROM HEADERS UNTIL WE CAN MAKE PRETTYTABLES WORK #
 print(sample.DOS_HEADER)
@@ -283,8 +163,8 @@ print(sample.OPTIONAL_HEADER)
 
 if len(sections) > 0:
     for section in sections:
-        name, addr, size = section
-        SectionsTable.add_row([name, hex(addr), size])
+        name, addr, size, entropy = section
+        SectionsTable.add_row([name, hex(addr), size, entropy])
 print(SectionsTable.get_string(title="PE File Sections"))
 
 if len(imports) > 0:
